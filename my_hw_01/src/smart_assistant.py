@@ -1,11 +1,16 @@
 import argparse
 import sys
+import time
 from typing import Optional
 
 from core.classifier import classify_with_fallback
-from core.qhandlers import request_branch, change_character
+from core.qhandlers import get_request_branch
 from core.memory import MemoryManager
 from utils.characters import CHARACTER_PROMPTS
+
+from langchain_core.globals import set_llm_cache
+from langchain_core.caches import InMemoryCache
+from langchain_community.callbacks import get_openai_callback
 
 
 class SmartAssistant:
@@ -20,11 +25,12 @@ class SmartAssistant:
             max_buffer_size=10,
         )
         self.current_character = initial_character
-        change_character(initial_character)
+        self.request_branch = get_request_branch(initial_character)
 
         self.model_name = model_name or "qwen2.5-7b-instruct"
 
-    def process(self, user_input: str) -> str:
+    def process(self, user_input: str):
+        
         if not user_input.strip():
             return ""
 
@@ -32,21 +38,29 @@ class SmartAssistant:
         self.memory.add_user_message(user_input)
 
         try:
-            response_obj = request_branch.invoke({
-                "classification": classification,
-                "query": user_input,
-                "history": self.memory.get_history(),
-            })
+            with get_openai_callback() as cb:
+                response_obj = self.request_branch.invoke({
+                    "classification": classification,
+                    "query": user_input,
+                    "history": self.memory.get_history(),
+                },
+                config={"callbacks": [cb]})
 
-            answer = response_obj.content
+                print(f"[{response_obj['request_type'].value}] ", end="", flush=True)
 
-            self.memory.add_assistant_message(answer)
+                full_answer = ""
 
-            return (
-                f"[{response_obj.request_type.value}] {answer}\n"
-                f"confidence: {response_obj.confidence:.2f} | "
-                f"tokens: {response_obj.tokens_used}"
-            )
+                start = time.time()
+                for chunk in response_obj["stream"]:
+                    content_piece = chunk.content
+                    print(content_piece, end="", flush=True)
+                    full_answer += content_piece
+                end = time.time()
+                print()
+                print(f"confidence: {response_obj['confidence']:.2f} | tokens: {cb.completion_tokens} | total cost: {cb.total_cost} | time {end - start:.2f}s")
+
+                self.memory.add_assistant_message(full_answer)
+
         except Exception as e:
             return f"[ERROR] {str(e)}"
 
@@ -98,8 +112,8 @@ class SmartAssistant:
         elif command == "/character":
             name = arg.lower()
             if name in CHARACTER_PROMPTS:
-                change_character(name)
                 self.current_character = name
+                self.request_branch = get_request_branch(name)
                 print(f"Changed character: {name}\n")
             else:
                 print(f"Available characters: {', '.join(CHARACTER_PROMPTS.keys())}\n")
@@ -133,6 +147,8 @@ class SmartAssistant:
 
 
 def main():
+    set_llm_cache(InMemoryCache())
+
     parser = argparse.ArgumentParser(description="Smart Assistant CLI")
     parser.add_argument("--character", default="friendly",
                         choices=list(CHARACTER_PROMPTS.keys()),

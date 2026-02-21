@@ -6,8 +6,6 @@ from langchain_core.messages import (
     SystemMessage,
 )
 from langchain_core.prompts import ChatPromptTemplate
-
-from utils.characters import CHARACTER_PROMPTS
 from core.qhandlers import model
 
 

@@ -3,11 +3,27 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import RunnableBranch, RunnableLambda
 from langchain_openai import ChatOpenAI
 
-from utils.schemas import RequestType, AssistantResponse
+from utils.schemas import RequestType
 from utils.characters import CHARACTER_PROMPTS
 
 
-model = ChatOpenAI(base_url="http://localhost:1234/v1", api_key="lm-studio", model="qwen2.5-7b-instruct-1m")
+primary_model = ChatOpenAI(
+    base_url="http://localhost:1234/v1",
+    api_key="lm-studio",
+    model="qwen2.5-7b-instruct-1m",
+    streaming=True,
+    stream_options={"include_usage": True} 
+)
+
+fallback_model = ChatOpenAI(
+    base_url="http://localhost:1234/v1",
+    api_key="lm-studio",
+    model="glm-4.6v-flash",
+    streaming=True,
+    stream_options={"include_usage": True} 
+)
+
+model = primary_model.with_fallbacks([fallback_model])
 
 def create_handler_chains(character: str = "friendly"):
 
@@ -62,51 +78,36 @@ def create_handler_chains(character: str = "friendly"):
     ])
 
     chains = {
-        RequestType.QUESTION:    question_prompt   | model,
-        RequestType.TASK:        task_prompt       | model,
+        RequestType.QUESTION:    question_prompt | model,
+        RequestType.TASK:        task_prompt     | model,
         RequestType.SMALL_TALK:  small_talk_prompt | model,
-        RequestType.COMPLAINT:   complaint_prompt  | model,
-        RequestType.UNKNOWN:     unknown_prompt    | model,
+        RequestType.COMPLAINT:   complaint_prompt | model,
+        RequestType.UNKNOWN:     unknown_prompt   | model,
     }
-
     return chains
 
 def wrap_with_response(chain, request_type: RequestType):
     def inner(input_dict):
-        content = chain.invoke(input_dict)
-
-        return AssistantResponse(
-            content=content.content,
-            request_type=request_type,
-            confidence=input_dict["classification"].confidence,
-            tokens_used=content.usage_metadata['output_tokens'],
-        )
+        return {
+            "stream": chain.stream(input_dict),
+            "request_type": request_type,
+            "confidence": input_dict["classification"].confidence
+        }
 
     return RunnableLambda(inner)
 
-current_chains = create_handler_chains("friendly")
-
-request_branch = RunnableBranch(
-    (
-        lambda x: x["classification"].request_type == RequestType.QUESTION,
-        wrap_with_response(current_chains[RequestType.QUESTION], RequestType.QUESTION)
-    ),
-    (
-        lambda x: x["classification"].request_type == RequestType.TASK,
-        wrap_with_response(current_chains[RequestType.TASK], RequestType.TASK)
-    ),
-    (
-        lambda x: x["classification"].request_type == RequestType.SMALL_TALK,
-        wrap_with_response(current_chains[RequestType.SMALL_TALK], RequestType.SMALL_TALK)
-    ),
-    (
-        lambda x: x["classification"].request_type == RequestType.COMPLAINT,
-        wrap_with_response(current_chains[RequestType.COMPLAINT], RequestType.COMPLAINT)
-    ),
-    wrap_with_response(current_chains[RequestType.UNKNOWN], RequestType.UNKNOWN)
-)
-
-
-def change_character(character: str):
-    global current_chains
-    current_chains = create_handler_chains(character)
+def get_request_branch(character: str = "friendly"):
+    chains = create_handler_chains(character)
+    
+    branch = RunnableBranch(
+        (lambda x: x["classification"].request_type == RequestType.QUESTION,
+         wrap_with_response(chains[RequestType.QUESTION], RequestType.QUESTION)),
+        (lambda x: x["classification"].request_type == RequestType.TASK,
+         wrap_with_response(chains[RequestType.TASK], RequestType.TASK)),
+        (lambda x: x["classification"].request_type == RequestType.SMALL_TALK,
+         wrap_with_response(chains[RequestType.SMALL_TALK], RequestType.SMALL_TALK)),
+        (lambda x: x["classification"].request_type == RequestType.COMPLAINT,
+         wrap_with_response(chains[RequestType.COMPLAINT], RequestType.COMPLAINT)),
+        wrap_with_response(chains[RequestType.UNKNOWN], RequestType.UNKNOWN)
+    )
+    return branch
